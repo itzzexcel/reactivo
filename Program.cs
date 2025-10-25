@@ -44,6 +44,7 @@ class Program
 
     private static void OnFrequencyDetected(bool hasBass, bool hasTreble, float bassLevel, float trebleLevel, bool beatDetected, float currentBPM)
     {
+        // Not updated / won't fix
         //var now = DateTime.Now;
         //var bassStatus = "";
         //var trebleStatus = "";
