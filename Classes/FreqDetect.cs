@@ -1,6 +1,8 @@
 ﻿using NAudio.CoreAudioApi;
 using NAudio.Dsp;
 using NAudio.Wave;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using reactivo.Classes;
 using System;
 using System.Text.RegularExpressions;
@@ -24,8 +26,6 @@ public class FrequencyDetector
     // Frequency ranges (Hz)
     private const int BassMaxFreq = 200;
     private const int TrebleMinFreq = 4000;
-
-    public event Action<bool, bool, float, float, bool, float>? FrequencyDetected; // (hasBass, hasTreble, bassLevel, trebleLevel, beatDetected, currentBPM)
 
     private int _analysisCounter = 0;
     private float _maxBassLevel = 0;
@@ -111,7 +111,7 @@ public class FrequencyDetector
         }
     }
 
-    private void PerformAnalysis()
+    private async void PerformAnalysis()
     {
         try
         {
@@ -206,18 +206,43 @@ public class FrequencyDetector
             hasTreble = trebleAverage > TrebleThreshold;
 
             // Debug output every 'x' analyses
-            if (_analysisCounter % 10 == 0)
+            if (_analysisCounter % 1 == 0)
             {
-                Console.WriteLine($"Debug #{_analysisCounter}: Energy={energy:F6}, Bass={bassAverage:F6} (max={_maxBassLevel:F6}), " +
-                                    $"Treble={trebleAverage:F6} (max={_maxTrebleLevel:F6}), BPM={_lastBPM:F1}");
-                if (maxBassMag > 0)
-                    Console.WriteLine($"  Strongest Bass: {maxBassFreq:F0}Hz @ {maxBassMag:F6}");
-                if (maxTrebleMag > 0)
-                    Console.WriteLine($"  Strongest Treble: {maxTrebleFreq:F0}Hz @ {maxTrebleMag:F6}");
+                if (true)
+                {
+                    var debugEntry = new
+                    {
+                        utime = DateTime.UtcNow.Ticks,
+                        analysis = _analysisCounter,
+                        energy = energy,
+                        bass = new
+                        {
+                            average = bassAverage,
+                            max = _maxBassLevel,
+                            strongest = maxBassMag > 0 ? new { frequency = maxBassFreq, magnitude = maxBassMag } : null
+                        },
+                        treble = new
+                        {
+                            average = trebleAverage,
+                            max = _maxTrebleLevel,
+                            strongest = maxTrebleMag > 0 ? new { frequency = maxTrebleFreq, magnitude = maxTrebleMag } : null
+                        },
+                        bpm = _lastBPM
+                    };
+
+                    // Serialize with indentation, then convert the default space-based indentation
+                    // into tab-based indentation with 4 tabs per level.
+                    var options = new System.Text.Json.JsonSerializerOptions { WriteIndented = true };
+                    string jsonArray = System.Text.Json.JsonSerializer.Serialize(new[] { debugEntry }, options);
+                    Globals.webSocket.BroadcastMessage(jsonArray);
+                    // Globals.namedPipe.Send(jsonArray);
+
+                    Console.WriteLine(JToken.Parse(jsonArray).ToString(Formatting.Indented).ToString());
+                }
             }
 
             // Trigger event
-            FrequencyDetected?.Invoke(hasBass, hasTreble, bassAverage, trebleAverage, beatDetected, _lastBPM);
+            // FrequencyDetected?.Invoke(hasBass, hasTreble, bassAverage, trebleAverage, beatDetected, _lastBPM);
         }
         catch (Exception ex)
         {
