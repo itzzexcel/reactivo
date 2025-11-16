@@ -23,9 +23,9 @@ namespace reactivo.Classes
                 _server = new NamedPipeServerStream(_pipeName, PipeDirection.Out, 1, PipeTransmissionMode.Message, PipeOptions.Asynchronous);
             }
 
-            Console.WriteLine($"Waiting for client to connect on pipe '{_pipeName}'...");
+            ConsoleManager.Log($"Waiting for client to connect on pipe '{_pipeName}'...");
             _server.WaitForConnection();
-            Console.WriteLine("Client connected!");
+            ConsoleManager.Log("Client connected!");
         }
 
         /// <summary>
@@ -56,7 +56,7 @@ namespace reactivo.Classes
                 _server.Close();
                 _server.Dispose();
                 _server = null;
-                Console.WriteLine("Pipe server closed.");
+                ConsoleManager.Log("Pipe server closed.");
             }
         }
     }

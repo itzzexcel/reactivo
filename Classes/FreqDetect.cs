@@ -47,21 +47,21 @@ public class FrequencyDetector
         var enumerator = new MMDeviceEnumerator();
         var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
 
-        Console.WriteLine($"Monitoring audio from: {device.FriendlyName}");
+        ConsoleManager.Log($"Monitoring audio from: {device.FriendlyName}");
 
         _capture = new WasapiLoopbackCapture(device);
         _capture.DataAvailable += OnDataAvailable!;
         _capture.RecordingStopped += OnRecordingStopped!;
 
-        Console.WriteLine($"Sample Rate: {_capture.WaveFormat.SampleRate} Hz");
-        Console.WriteLine($"Channels: {_capture.WaveFormat.Channels}");
-        Console.WriteLine($"Bits per Sample: {_capture.WaveFormat.BitsPerSample}");
+        ConsoleManager.Log($"Sample Rate: {_capture.WaveFormat.SampleRate} Hz");
+        ConsoleManager.Log($"Channels: {_capture.WaveFormat.Channels}");
+        ConsoleManager.Log($"Bits per Sample: {_capture.WaveFormat.BitsPerSample}");
 
         _capture.StartRecording();
 
-        Console.WriteLine("Audio monitoring started. Press 'q' to quit.");
-        Console.WriteLine("Monitoring: Bass (20-250 Hz), Treble (4000-20000 Hz), and Tempo (BPM)");
-        Console.WriteLine("Debug info will show every 50 analyses...\n");
+        ConsoleManager.Log("Audio monitoring started. Press 'q' to quit.");
+        ConsoleManager.Log("Monitoring: Bass (20-250 Hz), Treble (4000-20000 Hz), and Tempo (BPM)");
+        ConsoleManager.Log("Debug info will show every 50 analyses...\n");
     }
 
     public void StopMonitoring()
@@ -107,7 +107,7 @@ public class FrequencyDetector
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error in OnDataAvailable: {ex.Message}");
+            ConsoleManager.Log($"Error in OnDataAvailable: {ex.Message}");
         }
     }
 
@@ -237,7 +237,7 @@ public class FrequencyDetector
                     Globals.webSocket.BroadcastMessage(jsonArray);
                     // Globals.namedPipe.Send(jsonArray);
 
-                    Console.WriteLine(JToken.Parse(jsonArray).ToString(Formatting.Indented).ToString());
+                    ConsoleManager.Log(JToken.Parse(jsonArray).ToString(Formatting.Indented).ToString());
                 }
             }
 
@@ -246,7 +246,7 @@ public class FrequencyDetector
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error in PerformAnalysis: {ex.Message}");
+            ConsoleManager.Log($"Error in PerformAnalysis: {ex.Message}");
         }
     }
 
@@ -254,11 +254,11 @@ public class FrequencyDetector
     {
         if (e.Exception != null)
         {
-            Console.WriteLine($"Recording stopped due to error: {e.Exception.Message}");
+            ConsoleManager.Log($"Recording stopped due to error: {e.Exception.Message}");
         }
         else
         {
-            Console.WriteLine("Recording stopped.");
+            ConsoleManager.Log("Recording stopped.");
         }
     }
 

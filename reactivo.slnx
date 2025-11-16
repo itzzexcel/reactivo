@@ -1,3 +1,9 @@
 <Solution>
-  <Project Path="reactivo.csproj" />
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="reactivo.csproj">
+    <Platform Project="x64" />
+    <Build Solution="Debug|*" Project="false" />
+  </Project>
 </Solution>

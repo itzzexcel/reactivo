@@ -39,7 +39,7 @@ namespace reactivo.Classes
             try
             {
                 httpListener.Start();
-                Console.WriteLine($"WebSocket started @ ws://localhost:{port}/");
+                ConsoleManager.Log($"WebSocket started @ ws://localhost:{port}/");
 
                 while (!cancellationTokenSource.Token.IsCancellationRequested)
                 {
@@ -57,7 +57,7 @@ namespace reactivo.Classes
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error: {ex.Message}");
+                ConsoleManager.Log($"Error: {ex.Message}");
             }
         }
 
@@ -73,7 +73,7 @@ namespace reactivo.Classes
                 connectedClients.Add(webSocket);
             }
 
-            Console.WriteLine($"Cliente conectado.");
+            ConsoleManager.Log($"Cliente conectado.");
 
             await HandleWebSocketConnection(webSocket);
 
@@ -97,7 +97,7 @@ namespace reactivo.Classes
                 if (result.MessageType == WebSocketMessageType.Text)
                 {
                     var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    Console.WriteLine($"Message received: {message}");
+                    ConsoleManager.Log($"Message received: {message}");
                 }
                 else if (result.MessageType == WebSocketMessageType.Close)
                 {
