@@ -1,10 +1,12 @@
-﻿using NAudio.CoreAudioApi;
+﻿using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
+using NAudio.CoreAudioApi;
 using NAudio.Dsp;
 using NAudio.Wave;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using reactivo.Classes;
 using System;
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -18,6 +20,8 @@ public class FrequencyDetector
     private Complex[] _fftBuffer;
     private float[] _audioBuffer;
     private int _audioBufferPosition = 0;
+    private AudioDeviceNotifier? _deviceNotifier;
+    private MMDevice? _currentDevice;
 
     // Thresholds
     private const float BassThreshold = 0.001f;
@@ -33,7 +37,12 @@ public class FrequencyDetector
     private BPMDetect _beatDetector;
     private float _lastBPM = 0;
     private DateTime _lastBPMUpdate = DateTime.MinValue;
+    private bool _isRunning = false;
 
+    // Error codes for Exclusive Mode
+    private const int AUDCLNT_E_DEVICE_IN_USE = unchecked((int)0x8889000A);
+    private const int AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED = unchecked((int)0x88890008);
+    private const int AUDCLNT_E_DEVICE_INVALIDATED = unchecked((int)0x88890004);
 
     public FrequencyDetector()
     {
@@ -44,30 +53,127 @@ public class FrequencyDetector
 
     public void StartMonitoring()
     {
-        var enumerator = new MMDeviceEnumerator();
-        var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
+        try
+        {
+            _isRunning = true;
 
-        ConsoleManager.Log($"Monitoring audio from: {device.FriendlyName}");
+            // Setup device change notifications
+            _deviceNotifier = new AudioDeviceNotifier();
+            _deviceNotifier.DefaultDeviceChanged += OnDefaultDeviceChanged;
 
-        _capture = new WasapiLoopbackCapture(device);
-        _capture.DataAvailable += OnDataAvailable!;
-        _capture.RecordingStopped += OnRecordingStopped!;
+            // Start capture with current device
+            InitializeCapture();
+        }
+        catch (Exception ex)
+        {
+            ConsoleManager.Log($"Error starting monitoring: {ex.Message}");
+            Globals.Announce($"{"Audio Error\n\n"}{ex.Message}");
+        }
+    }
 
-        ConsoleManager.Log($"Sample Rate: {_capture.WaveFormat.SampleRate} Hz");
-        ConsoleManager.Log($"Channels: {_capture.WaveFormat.Channels}");
-        ConsoleManager.Log($"Bits per Sample: {_capture.WaveFormat.BitsPerSample}");
+    private void InitializeCapture()
+    {
+        try
+        {
+            var enumerator = new MMDeviceEnumerator();
+            _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
 
-        _capture.StartRecording();
+            ConsoleManager.Log($"Monitoring audio from: {_currentDevice.FriendlyName}");
 
-        ConsoleManager.Log("Audio monitoring started. Press 'q' to quit.");
-        ConsoleManager.Log("Monitoring: Bass (20-250 Hz), Treble (4000-20000 Hz), and Tempo (BPM)");
-        ConsoleManager.Log("Debug info will show every 50 analyses...\n");
+            _capture = new WasapiLoopbackCapture(_currentDevice);
+            _capture.DataAvailable += OnDataAvailable!;
+            _capture.RecordingStopped += OnRecordingStopped!;
+
+            ConsoleManager.Log($"Sample Rate: {_capture.WaveFormat.SampleRate} Hz");
+            ConsoleManager.Log($"Channels: {_capture.WaveFormat.Channels}");
+            ConsoleManager.Log($"Bits per Sample: {_capture.WaveFormat.BitsPerSample}");
+
+            _capture.StartRecording();
+
+            ConsoleManager.Log("Audio monitoring started. Press 'q' to quit.");
+            ConsoleManager.Log("Monitoring: Bass (20-250 Hz), Treble (4000-20000 Hz), and Tempo (BPM)");
+            ConsoleManager.Log("Debug info will show every 50 analyses...\n");
+        }
+        catch (COMException comEx)
+        {
+            HandleCOMException(comEx);
+        }
+        catch (Exception ex)
+        {
+            ConsoleManager.Log($"Error initializing capture: {ex.Message}");
+            throw;
+        }
+    }
+
+    private void HandleCOMException(COMException comEx)
+    {
+        string message;
+
+        switch (comEx.HResult)
+        {
+            case AUDCLNT_E_DEVICE_IN_USE:
+                message = "The audio device is being used exclusively by another application.\n\n" +
+                          "Please close other audio applications or disable exclusive mode in:\n" +
+                          "Windows Settings > Sound > Device Properties > Advanced Options";
+                ConsoleManager.Log("ERROR: Device in exclusive use (AUDCLNT_E_DEVICE_IN_USE)");
+                break;
+
+            case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED:
+                message = "Exclusive mode is not allowed for this device.\n\n" +
+                          "Try disabling exclusive mode in Windows settings.";
+                ConsoleManager.Log("ERROR: Exclusive mode not allowed (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED)");
+                break;
+
+            case AUDCLNT_E_DEVICE_INVALIDATED:
+                message = "The audio device has been disconnected or is invalid.\n\n" +
+                          "Verify that the device is properly connected.";
+                ConsoleManager.Log("ERROR: Device invalidated (AUDCLNT_E_DEVICE_INVALIDATED)");
+                break;
+
+            default:
+                message = $"Error accessing audio device (Code: 0x{comEx.HResult:X8}):\n\n{comEx.Message}";
+                ConsoleManager.Log($"COM ERROR: {comEx.HResult:X8} - {comEx.Message}");
+                break;
+        }
+
+        Globals.Announce($"{"Audio Error\n\n"}{message}");
+    }
+
+    private void OnDefaultDeviceChanged(DataFlow flow, Role role, string deviceId)
+    {
+        if (!_isRunning) return;
+
+        ConsoleManager.Log("Default device changed detected. Restarting capture...");
+
+        Task.Run(() =>
+        {
+            try
+            {
+                // Stop current capture
+                _capture?.StopRecording();
+                _capture?.Dispose();
+                _capture = null;
+
+                // Small delay to ensure device is ready
+                Thread.Sleep(500);
+
+                // Restart with new device
+                InitializeCapture();
+            }
+            catch (Exception ex)
+            {
+                ConsoleManager.Log($"Error switching device: {ex.Message}");
+            }
+        });
     }
 
     public void StopMonitoring()
     {
+        _isRunning = false;
         _capture?.StopRecording();
         _capture?.Dispose();
+        _deviceNotifier?.Dispose();
+        _currentDevice?.Dispose();
     }
 
     private void OnDataAvailable(object sender, WaveInEventArgs e)
@@ -254,12 +360,18 @@ public class FrequencyDetector
     {
         if (e.Exception != null)
         {
-            ConsoleManager.Log($"Recording stopped due to error: {e.Exception.Message}");
+            if (e.Exception is COMException comEx)
+            {
+                HandleCOMException(comEx);
+            }
+            else
+            {
+                ConsoleManager.Log($"Recording stopped due to error: {e.Exception.Message}");
+            }
         }
         else
         {
             ConsoleManager.Log("Recording stopped.");
         }
     }
-
 }
