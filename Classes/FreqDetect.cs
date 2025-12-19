@@ -1,21 +1,15 @@
-﻿using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
-using NAudio.CoreAudioApi;
+﻿using NAudio.CoreAudioApi;
 using NAudio.Dsp;
 using NAudio.Wave;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using reactivo.Classes;
-using System;
 using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace reactivo.Classes;
 
 public class FrequencyDetector
 {
-    private WasapiLoopbackCapture? _capture;
+    public WasapiLoopbackCapture? _capture;
     private readonly int _bufferSize = 2048;
     private Complex[] _fftBuffer;
     private float[] _audioBuffer;
@@ -37,7 +31,7 @@ public class FrequencyDetector
     private BPMDetect _beatDetector;
     private float _lastBPM = 0;
     private DateTime _lastBPMUpdate = DateTime.MinValue;
-    private bool _isRunning = false;
+    public bool _isRunning = false;
 
     // Error codes for Exclusive Mode
     private const int AUDCLNT_E_DEVICE_IN_USE = unchecked((int)0x8889000A);
@@ -59,26 +53,77 @@ public class FrequencyDetector
 
             // Setup device change notifications
             _deviceNotifier = new AudioDeviceNotifier();
-            _deviceNotifier.DefaultDeviceChanged += OnDefaultDeviceChanged;
 
             // Start capture with current device
             InitializeCapture();
         }
         catch (Exception ex)
         {
-            ConsoleManager.Log($"Error starting monitoring: {ex.Message}");
-            Globals.Announce($"{"Audio Error\n\n"}{ex.Message}");
+            ConsoleManager.Log($"Error starting monitoring:\n{ex.Message}\n{ex.StackTrace}\n{ex.InnerException}");
+            Globals.Announce($"{"Audio Error\n\n"}{ex.Message}\n{ex.StackTrace}\n{ex.InnerException}");
         }
     }
 
-    private void InitializeCapture()
+    public void InitializeCapture()
     {
+        var enumerator = new MMDeviceEnumerator();
+
+        if (string.IsNullOrEmpty(Globals.tidalReceivedDevice))
+        {
+            Console.WriteLine("Plugin is probably not running. Waiting it 67s...");
+            int attempts = 0;
+            while (string.IsNullOrEmpty(Globals.tidalReceivedDevice) && attempts < 67)
+            {
+                Thread.Sleep(1000);
+                attempts++;
+            }
+
+            if (string.IsNullOrEmpty(Globals.tidalReceivedDevice))
+            {
+                ConsoleManager.Log("Timeouted. Changing to default playback device.");
+                _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            }
+        }
+
         try
         {
-            var enumerator = new MMDeviceEnumerator();
-            _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
+            if (Globals.tidalReceivedDevice == "default")
+            {
+                _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            }
+            else
+            {
+                bool deviceExists = false;
+                foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+                {
+                    if (device.ID == Globals.tidalReceivedDevice)
+                    {
+                        _currentDevice = device;
+                        deviceExists = true;
+                        ConsoleManager.Log($"Device found!: {device.FriendlyName}");
+                        break;
+                    }
+                }
 
-            ConsoleManager.Log($"Monitoring audio from: {_currentDevice.FriendlyName}");
+                if (!deviceExists)
+                {
+                    ConsoleManager.Log($"Device not found: {Globals.tidalReceivedDevice}");
+                    ConsoleManager.Log("Using default device.");
+                    _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            ConsoleManager.Log($"Couldn't get device: {ex.Message}");
+            _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+        }
+
+        try
+        {
+            var propertyStore = _currentDevice!.Properties;
+
+            ConsoleManager.Log($"Monitoring audio from: {_currentDevice.FriendlyName} // {_currentDevice.ID}");
 
             _capture = new WasapiLoopbackCapture(_currentDevice);
             _capture.DataAvailable += OnDataAvailable!;
@@ -180,25 +225,43 @@ public class FrequencyDetector
     {
         try
         {
-            int bytesPerSample = _capture!.WaveFormat.BitsPerSample / 8;
-            int channels = _capture!.WaveFormat.Channels;
-            int samplesAvailable = e.BytesRecorded / bytesPerSample;
+            if (_capture == null) return;
 
-            for (int i = 0; i < samplesAvailable; i += channels)
+            int bytesPerSample = _capture.WaveFormat.BitsPerSample / 8;
+            int channels = _capture.WaveFormat.Channels;
+
+            int bytesPerFrame = bytesPerSample * channels;
+            int framesAvailable = e.BytesRecorded / bytesPerFrame;
+
+            for (int frame = 0; frame < framesAvailable; frame++)
             {
-                float sample;
+                int byteOffset = frame * bytesPerFrame;
 
-                if (_capture!.WaveFormat.BitsPerSample == 32)
+                if (byteOffset + bytesPerSample > e.BytesRecorded)
+                    break;
+
+                float sample = 0f;
+
+                if (_capture.WaveFormat.BitsPerSample == 32)
                 {
-                    sample = BitConverter.ToSingle(e.Buffer, i * bytesPerSample);
+                    sample = BitConverter.ToSingle(e.Buffer, byteOffset);
                 }
-                else if (_capture!.WaveFormat.BitsPerSample == 16)
+                else if (_capture.WaveFormat.BitsPerSample == 16)
                 {
-                    sample = BitConverter.ToInt16(e.Buffer, i * bytesPerSample) / 32768.0f;
+                    sample = BitConverter.ToInt16(e.Buffer, byteOffset) / 32768.0f;
                 }
                 else
                 {
                     continue;
+                }
+
+                if (float.IsNaN(sample) || float.IsInfinity(sample))
+                    sample = 0f;
+
+                if (_audioBufferPosition >= _audioBuffer.Length)
+                {
+                    ConsoleManager.Log($"Audio buffer overflow. Position: {_audioBufferPosition}, Length: {_audioBuffer.Length}");
+                    _audioBufferPosition = 0;
                 }
 
                 _audioBuffer[_audioBufferPosition] = sample;
@@ -214,8 +277,12 @@ public class FrequencyDetector
         catch (Exception ex)
         {
             ConsoleManager.Log($"Error in OnDataAvailable: {ex.Message}");
+            ConsoleManager.Log($"Stack trace: {ex.StackTrace}");
+            _audioBufferPosition = 0;
         }
     }
+
+
 
     private async void PerformAnalysis()
     {
@@ -320,27 +387,30 @@ public class FrequencyDetector
                     {
                         utime = DateTime.UtcNow.Ticks,
                         analysis = _analysisCounter,
-                        energy = energy,
-                        bass = new
-                        {
-                            average = bassAverage,
-                            max = _maxBassLevel,
-                            strongest = maxBassMag > 0 ? new { frequency = maxBassFreq, magnitude = maxBassMag } : null
+                        energy = float.IsNaN(energy) || float.IsInfinity(energy) ? 0f : energy,
+                        bass = new {
+                            average = float.IsNaN(bassAverage) || float.IsInfinity(bassAverage) ? 0f : bassAverage,
+                            max = float.IsNaN(_maxBassLevel) || float.IsInfinity(_maxBassLevel) ? 0f : _maxBassLevel,
+                            strongest = maxBassMag > 0 && !float.IsNaN(maxBassFreq) && !float.IsInfinity(maxBassMag) ? new { frequency = maxBassFreq, magnitude = maxBassMag } : null
                         },
-                        treble = new
-                        {
-                            average = trebleAverage,
-                            max = _maxTrebleLevel,
-                            strongest = maxTrebleMag > 0 ? new { frequency = maxTrebleFreq, magnitude = maxTrebleMag } : null
+                        treble = new {
+                            average = float.IsNaN(trebleAverage) || float.IsInfinity(trebleAverage) ? 0f : trebleAverage,
+                            max = float.IsNaN(_maxTrebleLevel) || float.IsInfinity(_maxTrebleLevel) ? 0f : _maxTrebleLevel,
+                            strongest = maxTrebleMag > 0 && !float.IsNaN(maxTrebleFreq) && !float.IsInfinity(maxTrebleMag) ? new { frequency = maxTrebleFreq, magnitude = maxTrebleMag } : null
                         },
-                        bpm = _lastBPM
+                        bpm = float.IsNaN(_lastBPM) || float.IsInfinity(_lastBPM) ? 0f : _lastBPM
                     };
+
 
                     // Serialize with indentation, then convert the default space-based indentation
                     // into tab-based indentation with 4 tabs per level.
-                    var options = new System.Text.Json.JsonSerializerOptions { WriteIndented = true };
+                    var options = new System.Text.Json.JsonSerializerOptions
+                    {
+                        WriteIndented = true,
+                        NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals
+                    };
                     string jsonArray = System.Text.Json.JsonSerializer.Serialize(new[] { debugEntry }, options);
-                    Globals.webSocket.BroadcastMessage(jsonArray);
+                    _ = Globals.webSocket.BroadcastMessage(jsonArray);
                     // Globals.namedPipe.Send(jsonArray);
 
                     ConsoleManager.Log(JToken.Parse(jsonArray).ToString(Formatting.Indented).ToString());

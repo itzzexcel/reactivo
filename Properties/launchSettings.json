@@ -1,7 +1,8 @@
 {
   "profiles": {
     "reactivo": {
-      "commandName": "Project"
+      "commandName": "Project",
+      "commandLineArgs": "--show-console"
     }
   }
 }

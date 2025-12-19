@@ -1,10 +1,6 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Net;
+﻿using System.Net;
 using System.Net.WebSockets;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace reactivo.Classes
 {
@@ -73,7 +69,7 @@ namespace reactivo.Classes
                 connectedClients.Add(webSocket);
             }
 
-            ConsoleManager.Log($"Cliente conectado.");
+            ConsoleManager.Log($"Client connected!");
 
             await HandleWebSocketConnection(webSocket);
 
@@ -90,21 +86,76 @@ namespace reactivo.Classes
         {
             var buffer = new byte[1024 * 4];
 
-            while (webSocket.State == WebSocketState.Open)
+            try
             {
-                var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationTokenSource.Token);
+                while (webSocket.State == WebSocketState.Open)
+                {
+                    var result = await webSocket.ReceiveAsync(
+                        new ArraySegment<byte>(buffer),
+                        cancellationTokenSource.Token
+                    );
 
-                if (result.MessageType == WebSocketMessageType.Text)
-                {
-                    var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    ConsoleManager.Log($"Message received: {message}");
-                }
-                else if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
+                    if (result.MessageType == WebSocketMessageType.Text)
+                    {
+                        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                        if (!string.IsNullOrEmpty(message))
+                        {
+                            ConsoleManager.Log($"Got ID from WebSocket. Device: {message}");
+
+                            string previousDevice = Globals.tidalReceivedDevice;
+                            Globals.tidalReceivedDevice = message;
+
+                            if (previousDevice != message)
+                            {
+                                Program.DeviceChanged();
+                            }
+                        }
+                    }
+                    else if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        ConsoleManager.Log("Client terminated ws conncetion");
+                        await webSocket.CloseAsync(
+                            WebSocketCloseStatus.NormalClosure,
+                            "Cerrando",
+                            CancellationToken.None
+                        );
+                        break;
+                    }
                 }
             }
+            catch (WebSocketException wsEx)
+            {
+                ConsoleManager.Log($"WebSocket error: {wsEx.Message}");
+            }
+            catch (OperationCanceledException)
+            {
+                ConsoleManager.Log("WebSocket operation cancelled");
+            }
+            catch (Exception ex)
+            {
+                ConsoleManager.Log($"Unhandled exception: {ex.Message}");
+            }
+            finally
+            {
+                if (webSocket.State == WebSocketState.Open ||
+                    webSocket.State == WebSocketState.CloseReceived)
+                {
+                    try
+                    {
+                        await webSocket.CloseAsync(
+                            WebSocketCloseStatus.NormalClosure,
+                            "STATUS_CLOSING",
+                            CancellationToken.None
+                        );
+                    }
+                    catch { }
+                }
+
+                webSocket.Dispose();
+                ConsoleManager.Log("WebSocket closed...");
+            }
         }
+
 
         public async Task SendMessageToClient(WebSocket webSocket, string message)
         {

@@ -1,6 +1,5 @@
 ﻿using NAudio.CoreAudioApi;
 using NAudio.CoreAudioApi.Interfaces;
-using System;
 
 namespace reactivo.Classes;
 
@@ -18,11 +17,11 @@ public class AudioDeviceNotifier : IMMNotificationClient, IDisposable
 
     public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId)
     {
-        if (flow == DataFlow.Render && role == Role.Console)
-        {
-            ConsoleManager.Log($"Default output device changed!\nNew Device: {defaultDeviceId}");
-            DefaultDeviceChanged?.Invoke(flow, role, defaultDeviceId);
-        }
+        //if (flow == DataFlow.Render && role == Role.Console)
+        //{
+        //    ConsoleManager.Log($"Default output device changed!\nNew Device: {defaultDeviceId}");
+        //    DefaultDeviceChanged?.Invoke(flow, role, defaultDeviceId);
+        //}
     }
 
     public void OnDeviceAdded(string pwstrDeviceId) { }

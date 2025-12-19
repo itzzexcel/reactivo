@@ -1,13 +1,12 @@
-﻿using reactivo.Classes;
-using System.Net.WebSockets;
-using Microsoft.Win32;
-using System.Reflection;
+﻿using Microsoft.Win32;
+using reactivo.Classes;
 
 namespace reactivo;
 
 class Program
 {
-    private static bool _isRunning = true;
+
+    static FrequencyDetector detector = new FrequencyDetector();
 
     static async Task Main(string[] args)
     {
@@ -29,8 +28,6 @@ class Program
         }
 
         RegisterInStartup();
-
-        var detector = new FrequencyDetector();
 
         // IMPORTANT: If StartServerAsync returns a Task, store it
         var serverTask = Globals.webSocket.StartServerAsync();
@@ -98,6 +95,35 @@ class Program
         }
     }
 
+    public static void DeviceChanged()
+    {
+        Console.WriteLine($"Device changed to {Globals.tidalReceivedDevice}");
+
+        if (!detector._isRunning) return;
+
+        ConsoleManager.Log("Default device changed detected. Restarting capture...");
+
+        Task.Run(() =>
+        {
+            try
+            {
+                // Stop current capture
+                detector._capture?.StopRecording();
+                detector._capture?.Dispose();
+                detector._capture = null;
+
+                // Small delay to ensure device is ready
+                Thread.Sleep(500);
+
+                // Restart with new device
+                detector.InitializeCapture();
+            }
+            catch (Exception ex)
+            {
+                ConsoleManager.Log($"Error switching device: {ex.Message}");
+            }
+        });
+    }
 
     private static void RegisterInStartup()
     {
@@ -130,40 +156,5 @@ class Program
         {
             ConsoleManager.Log($"Failed to register startup: {ex.Message}");
         }
-    }
-
-    private static void OnFrequencyDetected(bool hasBass, bool hasTreble, float bassLevel, float trebleLevel, bool beatDetected, float currentBPM)
-    {
-        // Not updated / won't fix
-        //var now = DateTime.Now;
-        //var bassStatus = "";
-        //var trebleStatus = "";
-        //var beatStatus = "";
-
-        //if (hasBass && (now - _lastBassTime).TotalMilliseconds > 50)
-        //{
-        //    bassStatus = $"[BASS: {bassLevel:F6}]";
-        //    _lastBassTime = now;
-        //}
-
-        //if (hasTreble && (now - _lastTrebleTime).TotalMilliseconds > 50)
-        //{
-        //    trebleStatus = $"[TREBLE: {trebleLevel:F6}]";
-        //    _lastTrebleTime = now;
-        //}
-
-        //if (beatDetected && (now - _lastBeatTime).TotalMilliseconds > 100)
-        //{
-        //    beatStatus = $"[BEAT] BPM: {currentBPM:F1}";
-        //    _lastBeatTime = now;
-        //    _currentBPM = currentBPM;
-        //}
-
-        //// Show BPM updates even without beats if tempo changed significantly
-        //if (Math.Abs(currentBPM - _currentBPM) > 5 && currentBPM > 0)
-        //{
-        //    Console.WriteLine($"[BPM UPDATE: {currentBPM:F1}]");
-        //    _currentBPM = currentBPM;
-        //}
     }
 }
