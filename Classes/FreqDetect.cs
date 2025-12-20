@@ -221,70 +221,77 @@ public class FrequencyDetector
         _currentDevice?.Dispose();
     }
 
+    private readonly object _audioLock = new();
+
     private void OnDataAvailable(object sender, WaveInEventArgs e)
     {
-        try
+        lock (_audioLock)
         {
-            if (_capture == null) return;
-
-            int bytesPerSample = _capture.WaveFormat.BitsPerSample / 8;
-            int channels = _capture.WaveFormat.Channels;
-
-            int bytesPerFrame = bytesPerSample * channels;
-            int framesAvailable = e.BytesRecorded / bytesPerFrame;
-
-            for (int frame = 0; frame < framesAvailable; frame++)
+            try
             {
-                int byteOffset = frame * bytesPerFrame;
+                if (_capture == null) return;
 
-                if (byteOffset + bytesPerSample > e.BytesRecorded)
-                    break;
+                int bytesPerSample = _capture.WaveFormat.BitsPerSample / 8;
+                int channels = _capture.WaveFormat.Channels;
 
-                float sample = 0f;
+                int bytesPerFrame = bytesPerSample * channels;
+                int framesAvailable = e.BytesRecorded / bytesPerFrame;
 
-                if (_capture.WaveFormat.BitsPerSample == 32)
+                for (int frame = 0; frame < framesAvailable; frame++)
                 {
-                    sample = BitConverter.ToSingle(e.Buffer, byteOffset);
-                }
-                else if (_capture.WaveFormat.BitsPerSample == 16)
-                {
-                    sample = BitConverter.ToInt16(e.Buffer, byteOffset) / 32768.0f;
-                }
-                else
-                {
-                    continue;
-                }
+                    int byteOffset = frame * bytesPerFrame;
 
-                if (float.IsNaN(sample) || float.IsInfinity(sample))
-                    sample = 0f;
+                    if (byteOffset + bytesPerSample > e.BytesRecorded)
+                        break;
 
-                if (_audioBufferPosition >= _audioBuffer.Length)
-                {
-                    ConsoleManager.Log($"Audio buffer overflow. Position: {_audioBufferPosition}, Length: {_audioBuffer.Length}");
-                    _audioBufferPosition = 0;
-                }
+                    float sample = 0f;
 
-                _audioBuffer[_audioBufferPosition] = sample;
-                _audioBufferPosition++;
+                    if (_capture.WaveFormat.BitsPerSample == 32)
+                    {
+                        sample = BitConverter.ToSingle(e.Buffer, byteOffset);
+                    }
+                    else if (_capture.WaveFormat.BitsPerSample == 16)
+                    {
+                        sample = BitConverter.ToInt16(e.Buffer, byteOffset) / 32768.0f;
+                    }
+                    else
+                    {
+                        continue;
+                    }
 
-                if (_audioBufferPosition >= _bufferSize)
-                {
-                    PerformAnalysis();
-                    _audioBufferPosition = 0;
+                    if (float.IsNaN(sample) || float.IsInfinity(sample))
+                        sample = 0f;
+
+                    if (_audioBufferPosition >= _audioBuffer.Length)
+                    {
+                        ConsoleManager.Log($"Audio buffer overflow. Position: {_audioBufferPosition}, Length: {_audioBuffer.Length}");
+                        _audioBufferPosition = 0;
+                    }
+
+                    int bufferLen = _audioBuffer.Length;
+
+                    _audioBuffer[_audioBufferPosition++] = sample;
+
+                    if (_audioBufferPosition == bufferLen)
+                    {
+                        PerformAnalysis();
+                        _audioBufferPosition = 0;
+                    }
+
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            ConsoleManager.Log($"Error in OnDataAvailable: {ex.Message}");
-            ConsoleManager.Log($"Stack trace: {ex.StackTrace}");
-            _audioBufferPosition = 0;
+            catch (Exception ex)
+            {
+                ConsoleManager.Log($"Error in OnDataAvailable: {ex.Message}");
+                ConsoleManager.Log($"Stack trace: {ex.StackTrace}");
+                _audioBufferPosition = 0;
+            }
         }
     }
 
 
 
-    private async void PerformAnalysis()
+    private void PerformAnalysis()
     {
         try
         {
