@@ -1,0 +1,11 @@
+{
+	"name": "@itzzexcel/reactivo",
+	"description": "Reworking and stylising background for TIDAL",
+	"author": {
+		"name": "itzzexcel",
+		"url": "https://github.com/itzzexcel",
+		"avatarUrl": "https://avatar-cyan.vercel.app/api/pfp/686765279363334205/image"
+	},
+	"main": "./src/index.ts",
+	"type": "module"
+}
