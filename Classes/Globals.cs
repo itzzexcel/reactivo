@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 
 namespace reactivo.Classes
 {
@@ -10,12 +10,19 @@ namespace reactivo.Classes
 
         public static void Announce(string message)
         {
-            Process.Start(new ProcessStartInfo
+            try
             {
-                FileName = "msg.exe",
-                Arguments = $"* \"{message}\"",
-                CreateNoWindow = true
-            });
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "msg.exe",
+                    Arguments = $"* \"{message}\"",
+                    CreateNoWindow = true
+                });
+            }
+            catch (Exception ex)
+            {
+                ConsoleManager.Log($"Announce notification failed: {ex.Message}");
+            }
         }
     }
 }

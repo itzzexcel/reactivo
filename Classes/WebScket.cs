@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 
@@ -157,6 +157,17 @@ namespace reactivo.Classes
         }
 
 
+        public bool HasConnectedClients
+        {
+            get
+            {
+                lock (connectedClients)
+                {
+                    return connectedClients.Count > 0;
+                }
+            }
+        }
+
         public async Task SendMessageToClient(WebSocket webSocket, string message)
         {
             if (webSocket?.State == WebSocketState.Open)
@@ -166,16 +177,16 @@ namespace reactivo.Classes
             }
         }
 
-        public async Task BroadcastMessage(string message)
+        public async Task BroadcastBytesAsync(byte[] buffer)
         {
-            var buffer = Encoding.UTF8.GetBytes(message);
-
             List<WebSocket> snapshot;
             lock (connectedClients)
             {
+                if (connectedClients.Count == 0) return;
                 snapshot = new List<WebSocket>(connectedClients);
             }
 
+            var segment = new ArraySegment<byte>(buffer);
             var clientsToRemove = new List<WebSocket>();
 
             foreach (var client in snapshot)
@@ -184,7 +195,7 @@ namespace reactivo.Classes
                 {
                     try
                     {
-                        await client.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true, CancellationToken.None);
+                        await client.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
                     }
                     catch
                     {
@@ -193,7 +204,6 @@ namespace reactivo.Classes
                 }
                 else
                 {
-                    // Not open -> schedule remove.
                     clientsToRemove.Add(client);
                 }
             }
@@ -209,12 +219,20 @@ namespace reactivo.Classes
                         {
                             client?.Dispose();
                         }
-                        catch
-                        {
-                        }
+                        catch { }
                     }
                 }
             }
+        }
+
+        public async Task BroadcastMessage(string message)
+        {
+            lock (connectedClients)
+            {
+                if (connectedClients.Count == 0) return;
+            }
+            var buffer = Encoding.UTF8.GetBytes(message);
+            await BroadcastBytesAsync(buffer);
         }
 
         public async Task SendMessageToClient(int clientIndex, string message)
