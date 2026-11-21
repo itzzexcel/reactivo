@@ -1,15 +1,35 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using reactivo.Classes;
 
 namespace reactivo;
 
 class Program
 {
-
-    static FrequencyDetector detector = new FrequencyDetector();
+    static readonly FrequencyDetector detector = new();
 
     static async Task Main(string[] args)
     {
+        using var instanceMutex = new Mutex(true, @"Local\reactivo_singleton_mutex", out bool createdNew);
+        if (!createdNew)
+        {
+            ConsoleManager.LogEvent("Another reactivo instance is already running; exiting cleanly.");
+            return;
+        }
+
+        AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+        {
+            if (e.ExceptionObject is Exception ex)
+            {
+                ConsoleManager.LogError($"Unhandled AppDomain exception (terminating={e.IsTerminating}): {ex}");
+            }
+        };
+
+        TaskScheduler.UnobservedTaskException += (s, e) =>
+        {
+            ConsoleManager.LogError($"Unobserved task exception: {e.Exception}");
+            e.SetObserved();
+        };
+
         ConsoleManager.Hide();
         bool showConsole = false;
 
@@ -28,22 +48,28 @@ class Program
         }
 
         RegisterInStartup();
+        ConsoleManager.LogEvent("reactivo starting up...");
 
-        // IMPORTANT: If StartServerAsync returns a Task, store it
-        var serverTask = Globals.webSocket.StartServerAsync();
+        using var cts = new CancellationTokenSource();
+
+        Console.CancelKeyPress += (s, e) =>
+        {
+            e.Cancel = true;
+            cts.Cancel();
+        };
+
+        AppDomain.CurrentDomain.ProcessExit += (s, e) =>
+        {
+            try { cts.Cancel(); } catch { }
+        };
+
+        // Supervise WebSocket server independently so transient faults restart automatically
+        _ = RunSupervisedWebSocketAsync(cts.Token);
 
         try
         {
             detector.StartMonitoring();
 
-            // Create a cancellation token for clean shutdown
-            var cts = new CancellationTokenSource();
-            Console.CancelKeyPress += (s, e) => {
-                e.Cancel = true;
-                cts.Cancel();
-            };
-
-            // If console is visible, allow 'q' to quit
             if (showConsole)
             {
                 _ = Task.Run(async () =>
@@ -69,70 +95,65 @@ class Program
                 }, cts.Token);
             }
 
-            // Keep running until cancellation
             await Task.Delay(Timeout.Infinite, cts.Token);
         }
         catch (OperationCanceledException)
         {
-            // Normal shutdown
-            ConsoleManager.Log("Shutting down...");
+            ConsoleManager.LogEvent("Shutting down...");
         }
         catch (Exception ex)
         {
-            ConsoleManager.Log($"Error: {ex.Message}");
-            ConsoleManager.Log("Make sure your audio device is working and try running as administrator.");
-            ConsoleManager.Log($"Stack trace: {ex.StackTrace}");
+            ConsoleManager.LogError($"Fatal runtime loop error: {ex}");
         }
         finally
         {
             detector.StopMonitoring();
+            Globals.webSocket.StopServer();
+            ConsoleManager.LogEvent("reactivo stopped cleanly.");
         }
 
         if (ConsoleManager.HasConsole() && showConsole)
         {
             ConsoleManager.Log("Application ended. Press any key to exit.");
-            Console.ReadKey();
+            try { Console.ReadKey(); } catch { }
+        }
+    }
+
+    private static async Task RunSupervisedWebSocketAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Globals.webSocket.StartServerAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                ConsoleManager.LogError($"Supervised WebSocket wrapper caught exception: {ex.Message}");
+                try { await Task.Delay(2000, ct); } catch { break; }
+            }
         }
     }
 
     public static void DeviceChanged()
     {
-        Console.WriteLine($"Device changed to {Globals.tidalReceivedDevice}");
-
+        ConsoleManager.LogEvent($"Tidal active device updated to '{Globals.tidalReceivedDevice}'");
         if (!detector._isRunning) return;
-
-        ConsoleManager.Log("Default device changed detected. Restarting capture...");
-
-        Task.Run(() =>
-        {
-            try
-            {
-                // Stop current capture
-                detector._capture?.StopRecording();
-                detector._capture?.Dispose();
-                detector._capture = null;
-
-                // Small delay to ensure device is ready
-                Thread.Sleep(500);
-
-                // Restart with new device
-                detector.InitializeCapture();
-            }
-            catch (Exception ex)
-            {
-                ConsoleManager.Log($"Error switching device: {ex.Message}");
-            }
-        });
+        detector.RequestRecovery($"Tidal switched device to '{Globals.tidalReceivedDevice}'", 300);
     }
 
     private static void RegisterInStartup()
     {
         try
         {
-            string exePath = Environment.ProcessPath! ?? AppContext.BaseDirectory!;
+            string? exePath = Environment.ProcessPath;
             if (string.IsNullOrEmpty(exePath))
             {
-                ConsoleManager.Log("Unable to determine executable path for startup registration.");
+                ConsoleManager.LogEvent("Unable to determine executable path for startup registration.");
                 return;
             }
 
@@ -143,18 +164,18 @@ class Program
             {
                 if (key == null)
                 {
-                    ConsoleManager.Log("Failed to open or create registry key for startup registration.");
+                    ConsoleManager.LogEvent("Failed to open or create registry key for startup registration.");
                     return;
                 }
 
                 key.SetValue(appName, $"\"{exePath}\"", RegistryValueKind.String);
             }
 
-            ConsoleManager.Log($"Registered '{appName}' to run at user logon.");
+            ConsoleManager.LogEvent($"Registered '{appName}' to run at user logon.");
         }
         catch (Exception ex)
         {
-            ConsoleManager.Log($"Failed to register startup: {ex.Message}");
+            ConsoleManager.LogError($"Failed to register startup: {ex.Message}");
         }
     }
 }

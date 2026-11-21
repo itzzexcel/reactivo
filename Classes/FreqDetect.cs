@@ -9,6 +9,9 @@ namespace reactivo.Classes;
 
 public sealed class AudioAnalysisPayload
 {
+    [JsonPropertyName("version")]
+    public int version { get; set; } = 2;
+
     [JsonPropertyName("utime")]
     public long utime { get; set; }
 
@@ -62,12 +65,8 @@ public class FrequencyDetector
     private AudioDeviceNotifier? _deviceNotifier;
     private MMDevice? _currentDevice;
 
-    // Thresholds
-    private const float BassThreshold = 0.001f;
-    private const float TrebleThreshold = 0.001f;
-
-    // Frequency ranges (Hz)
-    private const int BassMaxFreq = 200;
+    // Thresholds & Frequency ranges (Hz)
+    private const int BassMaxFreq = 220;
     private const int TrebleMinFreq = 4000;
 
     private int _analysisCounter = 0;
@@ -76,7 +75,17 @@ public class FrequencyDetector
     private readonly BPMDetect _beatDetector;
     private float _lastBPM = 0f;
     private DateTime _lastBPMUpdate = DateTime.MinValue;
-    public bool _isRunning = false;
+    public volatile bool _isRunning = false;
+
+    // Serialized self-healing supervisor state
+    private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
+    private readonly SemaphoreSlim _wakeSignal = new(0, 1);
+    private CancellationTokenSource? _monitorCts;
+    private Task? _supervisorTask;
+    private volatile bool _recoveryRequested;
+    private volatile int _recoveryDelayMs = 600;
+    private int _consecutiveAnalysisErrors = 0;
+    private DateTime _lastFailureLogUtc = DateTime.MinValue;
 
     // Preallocated, zero-allocation serialization structures
     private readonly AudioAnalysisPayload _payload = new();
@@ -91,10 +100,12 @@ public class FrequencyDetector
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    // Error codes for Exclusive Mode
+    // Error codes for Exclusive Mode & Device Invalidation
     private const int AUDCLNT_E_DEVICE_IN_USE = unchecked((int)0x8889000A);
     private const int AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED = unchecked((int)0x88890008);
     private const int AUDCLNT_E_DEVICE_INVALIDATED = unchecked((int)0x88890004);
+
+    private readonly object _audioLock = new();
 
     public FrequencyDetector()
     {
@@ -114,172 +125,439 @@ public class FrequencyDetector
 
     public void StartMonitoring()
     {
+        if (_isRunning) return;
+
+        _isRunning = true;
+        _monitorCts = new CancellationTokenSource();
+        EnsureDeviceNotifier();
+
+        // Perform an immediate non-throwing initial capture attempt
+        _lifecycleLock.Wait();
         try
         {
-            _isRunning = true;
-
-            // Setup device change notifications
-            _deviceNotifier = new AudioDeviceNotifier();
-            _deviceNotifier.DefaultDeviceChanged += OnDefaultDeviceChanged;
-
-            // Start capture with current device
-            InitializeCapture();
+            InitializeCaptureLocked();
         }
-        catch (Exception ex)
+        finally
         {
-            ConsoleManager.Log($"Error starting monitoring:\n{ex.Message}\n{ex.StackTrace}\n{ex.InnerException}");
-            Globals.Announce($"Audio Error\n\n{ex.Message}\n{ex.StackTrace}\n{ex.InnerException}");
+            _lifecycleLock.Release();
         }
+
+        CancellationToken ct = _monitorCts.Token;
+        _supervisorTask = Task.Run(() => RunSupervisorLoopAsync(ct), ct);
     }
 
-    public void InitializeCapture()
-    {
-        var enumerator = new MMDeviceEnumerator();
-
-        try
-        {
-            if (string.IsNullOrEmpty(Globals.tidalReceivedDevice) || Globals.tidalReceivedDevice == "default")
-            {
-                _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-            }
-            else
-            {
-                bool deviceExists = false;
-                foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
-                {
-                    if (device.ID == Globals.tidalReceivedDevice)
-                    {
-                        _currentDevice = device;
-                        deviceExists = true;
-                        ConsoleManager.Log($"Device found!: {device.FriendlyName}");
-                        break;
-                    }
-                }
-
-                if (!deviceExists)
-                {
-                    ConsoleManager.Log($"Device not found: {Globals.tidalReceivedDevice}. Using default device.");
-                    _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            ConsoleManager.Log($"Couldn't get device: {ex.Message}");
-            _currentDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-        }
-
-        try
-        {
-            ConsoleManager.Log($"Monitoring audio from: {_currentDevice!.FriendlyName} // {_currentDevice.ID}");
-
-            _capture = new WasapiLoopbackCapture(_currentDevice);
-            _capture.DataAvailable += OnDataAvailable!;
-            _capture.RecordingStopped += OnRecordingStopped!;
-
-            ConsoleManager.Log($"Sample Rate: {_capture.WaveFormat.SampleRate} Hz");
-            ConsoleManager.Log($"Channels: {_capture.WaveFormat.Channels}");
-            ConsoleManager.Log($"Bits per Sample: {_capture.WaveFormat.BitsPerSample}");
-
-            _capture.StartRecording();
-
-            ConsoleManager.Log("Audio monitoring started.");
-            ConsoleManager.Log("Monitoring: Bass (20-200 Hz), Treble (4000-20000 Hz), and Tempo (BPM)");
-        }
-        catch (COMException comEx)
-        {
-            HandleCOMException(comEx);
-        }
-        catch (Exception ex)
-        {
-            ConsoleManager.Log($"Error initializing capture: {ex.Message}");
-            throw;
-        }
-    }
-
-    private void HandleCOMException(COMException comEx)
-    {
-        string message;
-
-        switch (comEx.HResult)
-        {
-            case AUDCLNT_E_DEVICE_IN_USE:
-                message = "The audio device is being used exclusively by another application.\n\n" +
-                          "Please close other audio applications or disable exclusive mode in:\n" +
-                          "Windows Settings > Sound > Device Properties > Advanced Options";
-                ConsoleManager.Log("ERROR: Device in exclusive use (AUDCLNT_E_DEVICE_IN_USE)");
-                break;
-
-            case AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED:
-                message = "Exclusive mode is not allowed for this device.\n\n" +
-                          "Try disabling exclusive mode in Windows settings.";
-                ConsoleManager.Log("ERROR: Exclusive mode not allowed (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED)");
-                break;
-
-            case AUDCLNT_E_DEVICE_INVALIDATED:
-                message = "The audio device has been disconnected or is invalid.\n\n" +
-                          "Verify that the device is properly connected.";
-                ConsoleManager.Log("ERROR: Device invalidated (AUDCLNT_E_DEVICE_INVALIDATED)");
-                break;
-
-            default:
-                message = $"Error accessing audio device (Code: 0x{comEx.HResult:X8}):\n\n{comEx.Message}";
-                ConsoleManager.Log($"COM ERROR: {comEx.HResult:X8} - {comEx.Message}");
-                break;
-        }
-
-        Globals.Announce($"Audio Error\n\n{message}");
-    }
-
-    private void OnDefaultDeviceChanged(DataFlow flow, Role role, string deviceId)
+    public void RequestRecovery(string reason, int delayMs = 600)
     {
         if (!_isRunning) return;
 
-        ConsoleManager.Log("Default device change detected. Restarting capture...");
+        ConsoleManager.LogEvent($"Recovery requested ({reason}, delay={delayMs}ms)");
+        _recoveryDelayMs = Math.Max(100, delayMs);
+        _recoveryRequested = true;
 
-        Task.Run(() =>
+        try
         {
+            if (_wakeSignal.CurrentCount == 0)
+            {
+                _wakeSignal.Release();
+            }
+        }
+        catch { }
+    }
+
+    private void EnsureDeviceNotifier()
+    {
+        if (_deviceNotifier != null) return;
+        try
+        {
+            var notifier = new AudioDeviceNotifier();
+            notifier.DefaultDeviceChanged += OnDefaultDeviceChanged;
+            notifier.DeviceStateChanged += OnDeviceStateChanged;
+            notifier.DeviceAdded += OnDeviceAdded;
+            notifier.DeviceRemoved += OnDeviceRemoved;
+            _deviceNotifier = notifier;
+        }
+        catch (Exception ex)
+        {
+            LogRateLimitedError($"AudioDeviceNotifier init failed: {ex.Message}");
+        }
+    }
+
+    private void DisposeDeviceNotifier()
+    {
+        var notifier = _deviceNotifier;
+        if (notifier == null) return;
+        _deviceNotifier = null;
+
+        try
+        {
+            notifier.DefaultDeviceChanged -= OnDefaultDeviceChanged;
+            notifier.DeviceStateChanged -= OnDeviceStateChanged;
+            notifier.DeviceAdded -= OnDeviceAdded;
+            notifier.DeviceRemoved -= OnDeviceRemoved;
+            notifier.Dispose();
+        }
+        catch { }
+    }
+
+    private void CleanupCaptureLocked()
+    {
+        var cap = _capture;
+        _capture = null;
+
+        if (cap != null)
+        {
+            try { cap.DataAvailable -= OnDataAvailable!; } catch { }
+            try { cap.RecordingStopped -= OnRecordingStopped!; } catch { }
+            try { cap.StopRecording(); } catch { }
+            try { cap.Dispose(); } catch { }
+        }
+
+        var dev = _currentDevice;
+        _currentDevice = null;
+        if (dev != null)
+        {
+            try { dev.Dispose(); } catch { }
+        }
+
+        lock (_audioLock)
+        {
+            _audioBufferPosition = 0;
+            _beatDetector.Reset();
+        }
+    }
+
+    private bool InitializeCaptureLocked()
+    {
+        CleanupCaptureLocked();
+
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            MMDevice? selectedDevice = null;
+
+            string requestedId = Globals.tidalReceivedDevice;
+            if (!string.IsNullOrEmpty(requestedId) && requestedId != "default")
+            {
+                try
+                {
+                    foreach (var dev in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+                    {
+                        if (selectedDevice == null && dev.ID == requestedId)
+                        {
+                            selectedDevice = dev;
+                        }
+                        else
+                        {
+                            dev.Dispose();
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogRateLimitedError($"EnumerateAudioEndPoints failed: {ex.Message}");
+                }
+
+                if (selectedDevice == null)
+                {
+                    ConsoleManager.LogEvent($"Requested device '{requestedId}' unavailable; falling back to default endpoint.");
+                }
+            }
+
+            if (selectedDevice != null && TryStartCaptureOnDevice(selectedDevice))
+            {
+                return true;
+            }
+
+            selectedDevice?.Dispose();
+
+            // Fallback to OS default multimedia render endpoint
+            MMDevice? fallbackDevice = null;
             try
             {
-                _capture?.StopRecording();
-                _capture?.Dispose();
-                _capture = null;
-
-                Thread.Sleep(300);
-                InitializeCapture();
+                fallbackDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            }
+            catch (COMException comEx)
+            {
+                LogRateLimitedError($"No active default audio endpoint (0x{comEx.HResult:X8}): {comEx.Message}");
+                return false;
             }
             catch (Exception ex)
             {
-                ConsoleManager.Log($"Error switching device: {ex.Message}");
+                LogRateLimitedError($"GetDefaultAudioEndpoint failed: {ex.Message}");
+                return false;
             }
-        });
+
+            if (fallbackDevice == null)
+            {
+                LogRateLimitedError("Default audio endpoint returned null.");
+                return false;
+            }
+
+            if (TryStartCaptureOnDevice(fallbackDevice))
+            {
+                return true;
+            }
+
+            fallbackDevice.Dispose();
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LogRateLimitedError($"InitializeCaptureLocked error: {ex.Message}");
+            return false;
+        }
+    }
+
+    private bool TryStartCaptureOnDevice(MMDevice device)
+    {
+        WasapiLoopbackCapture? cap = null;
+        try
+        {
+            if (device.State != DeviceState.Active)
+            {
+                LogRateLimitedError($"Device '{device.FriendlyName}' is not active ({device.State}).");
+                return false;
+            }
+
+            cap = new WasapiLoopbackCapture(device);
+            cap.DataAvailable += OnDataAvailable!;
+            cap.RecordingStopped += OnRecordingStopped!;
+            cap.StartRecording();
+
+            _currentDevice = device;
+            _capture = cap;
+            _consecutiveAnalysisErrors = 0;
+            _maxBassLevel = 0f;
+            _maxTrebleLevel = 0f;
+
+            ConsoleManager.LogEvent(
+                $"Capture active: {device.FriendlyName} ({cap.WaveFormat.SampleRate}Hz, {cap.WaveFormat.Channels}ch, {cap.WaveFormat.BitsPerSample}-bit)"
+            );
+            return true;
+        }
+        catch (COMException comEx)
+        {
+            if (cap != null)
+            {
+                try { cap.DataAvailable -= OnDataAvailable!; } catch { }
+                try { cap.RecordingStopped -= OnRecordingStopped!; } catch { }
+                try { cap.Dispose(); } catch { }
+            }
+            LogRateLimitedError(DescribeCOMException(comEx));
+            return false;
+        }
+        catch (Exception ex)
+        {
+            if (cap != null)
+            {
+                try { cap.DataAvailable -= OnDataAvailable!; } catch { }
+                try { cap.RecordingStopped -= OnRecordingStopped!; } catch { }
+                try { cap.Dispose(); } catch { }
+            }
+            LogRateLimitedError($"Failed starting WASAPI capture on '{device.FriendlyName}': {ex.Message}");
+            return false;
+        }
+    }
+
+    private static string DescribeCOMException(COMException comEx) => comEx.HResult switch
+    {
+        AUDCLNT_E_DEVICE_IN_USE => "WASAPI device in exclusive use (AUDCLNT_E_DEVICE_IN_USE); will retry automatically.",
+        AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => "WASAPI exclusive mode not allowed (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED); will retry.",
+        AUDCLNT_E_DEVICE_INVALIDATED => "WASAPI device invalidated/unplugged (AUDCLNT_E_DEVICE_INVALIDATED); recovering.",
+        _ => $"WASAPI COM error 0x{comEx.HResult:X8}: {comEx.Message}"
+    };
+
+    private static bool IsDeviceHealthy(MMDevice? device)
+    {
+        if (device == null) return false;
+        try
+        {
+            return device.State == DeviceState.Active;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task RunSupervisorLoopAsync(CancellationToken ct)
+    {
+        int backoffMs = 1000;
+
+        while (!ct.IsCancellationRequested && _isRunning)
+        {
+            try
+            {
+                EnsureDeviceNotifier();
+
+                bool needsRecovery = _recoveryRequested ||
+                                     _capture == null ||
+                                     _capture.CaptureState != CaptureState.Capturing ||
+                                     !IsDeviceHealthy(_currentDevice) ||
+                                     _consecutiveAnalysisErrors >= 10;
+
+                if (needsRecovery)
+                {
+                    int delay = _recoveryRequested ? _recoveryDelayMs : 0;
+                    _recoveryRequested = false;
+
+                    if (delay > 0)
+                    {
+                        await Task.Delay(delay, ct);
+                    }
+
+                    // Coalesce burst events arriving right around the delay
+                    _recoveryRequested = false;
+
+                    bool recovered = false;
+                    await _lifecycleLock.WaitAsync(ct);
+                    try
+                    {
+                        if (_isRunning && !ct.IsCancellationRequested)
+                        {
+                            recovered = InitializeCaptureLocked();
+                        }
+                    }
+                    finally
+                    {
+                        _lifecycleLock.Release();
+                    }
+
+                    if (recovered)
+                    {
+                        backoffMs = 1000;
+                        continue;
+                    }
+
+                    // Retry with bounded backoff, waking early if a hardware/endpoint event arrives
+                    await _wakeSignal.WaitAsync(backoffMs, ct);
+                    backoffMs = Math.Min(10000, backoffMs * 2);
+                    continue;
+                }
+
+                // Healthy state: sleep up to 3s and also detect OS sleep/hibernate clock jumps
+                DateTime beforeWaitUtc = DateTime.UtcNow;
+                await _wakeSignal.WaitAsync(3000, ct);
+                double wallElapsedSec = (DateTime.UtcNow - beforeWaitUtc).TotalSeconds;
+                if (wallElapsedSec > 12.0 && _isRunning && !ct.IsCancellationRequested)
+                {
+                    RequestRecovery($"System resume detected ({wallElapsedSec:F1}s wall jump)", 800);
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                LogRateLimitedError($"Supervisor loop error: {ex.Message}");
+                try { await Task.Delay(2000, ct); } catch { break; }
+            }
+        }
+    }
+
+    private void LogRateLimitedError(string message)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastFailureLogUtc).TotalSeconds >= 10.0)
+        {
+            _lastFailureLogUtc = now;
+            ConsoleManager.LogError(message);
+        }
+    }
+
+    private void OnDefaultDeviceChanged(DataFlow flow, Role role, string deviceId) =>
+        RequestRecovery($"Default device changed ({deviceId})", 400);
+
+    private void OnDeviceStateChanged(string deviceId, DeviceState newState)
+    {
+        if (MatchesMonitoredDevice(deviceId) || _capture == null || _capture.CaptureState != CaptureState.Capturing)
+        {
+            RequestRecovery($"Device state changed ({deviceId} -> {newState})", 500);
+        }
+    }
+
+    private void OnDeviceAdded(string deviceId)
+    {
+        if (_capture == null || _capture.CaptureState != CaptureState.Capturing || deviceId == Globals.tidalReceivedDevice)
+        {
+            RequestRecovery($"Device added ({deviceId})", 500);
+        }
+    }
+
+    private void OnDeviceRemoved(string deviceId)
+    {
+        if (MatchesMonitoredDevice(deviceId) || _capture == null)
+        {
+            RequestRecovery($"Device removed ({deviceId})", 500);
+        }
+    }
+
+    private bool MatchesMonitoredDevice(string deviceId)
+    {
+        if (string.IsNullOrEmpty(deviceId)) return true;
+        if (!string.IsNullOrEmpty(Globals.tidalReceivedDevice) && deviceId == Globals.tidalReceivedDevice)
+            return true;
+        try
+        {
+            return _currentDevice != null && _currentDevice.ID == deviceId;
+        }
+        catch
+        {
+            return true;
+        }
     }
 
     public void StopMonitoring()
     {
         _isRunning = false;
-        _capture?.StopRecording();
-        _capture?.Dispose();
-        _deviceNotifier?.Dispose();
-        _currentDevice?.Dispose();
+
+        try { _monitorCts?.Cancel(); } catch { }
+        try { _supervisorTask?.Wait(1500); } catch { }
+
+        if (_lifecycleLock.Wait(2000))
+        {
+            try
+            {
+                CleanupCaptureLocked();
+            }
+            finally
+            {
+                _lifecycleLock.Release();
+            }
+        }
+        else
+        {
+            CleanupCaptureLocked();
+        }
+
+        DisposeDeviceNotifier();
+
+        try { _monitorCts?.Dispose(); } catch { }
+        _monitorCts = null;
+        _supervisorTask = null;
     }
 
-    private readonly object _audioLock = new();
-
-    private void OnDataAvailable(object sender, WaveInEventArgs e)
+    private void OnDataAvailable(object? sender, WaveInEventArgs e)
     {
         lock (_audioLock)
         {
             try
             {
-                if (_capture == null) return;
+                var capture = _capture;
+                if (capture == null || !ReferenceEquals(sender, capture) || e.BytesRecorded <= 0)
+                    return;
 
-                int bytesPerSample = _capture.WaveFormat.BitsPerSample / 8;
-                int channels = _capture.WaveFormat.Channels;
+                int bitsPerSample = capture.WaveFormat.BitsPerSample;
+                int bytesPerSample = bitsPerSample / 8;
+                int channels = capture.WaveFormat.Channels;
                 int bytesPerFrame = bytesPerSample * channels;
+                if (bytesPerSample <= 0 || channels <= 0 || bytesPerFrame <= 0)
+                    return;
+
                 int framesAvailable = e.BytesRecorded / bytesPerFrame;
-                bool isFloat32 = _capture.WaveFormat.BitsPerSample == 32;
-                bool isPcm16 = _capture.WaveFormat.BitsPerSample == 16;
+                bool isFloat32 = bitsPerSample == 32;
+                bool isPcm16 = bitsPerSample == 16;
 
                 for (int frame = 0; frame < framesAvailable; frame++)
                 {
@@ -321,37 +599,42 @@ public class FrequencyDetector
                         continue;
                     }
 
-                    if (float.IsNaN(sample) || float.IsInfinity(sample))
+                    if (!float.IsFinite(sample))
                         sample = 0f;
 
                     _audioBuffer[_audioBufferPosition++] = sample;
 
                     if (_audioBufferPosition == _bufferSize)
                     {
-                        PerformAnalysis();
+                        PerformAnalysis(capture.WaveFormat.SampleRate);
 
-                        // Sliding window: shift buffer by hop size (512 samples) to maintain 75% overlap
                         int remaining = _bufferSize - _hopSize;
                         Array.Copy(_audioBuffer, _hopSize, _audioBuffer, 0, remaining);
                         _audioBufferPosition = remaining;
                     }
                 }
+
+                _consecutiveAnalysisErrors = 0;
             }
             catch (Exception ex)
             {
-                ConsoleManager.Log($"Error in OnDataAvailable: {ex.Message}");
                 _audioBufferPosition = 0;
+                int errCount = Interlocked.Increment(ref _consecutiveAnalysisErrors);
+                LogRateLimitedError($"Error in OnDataAvailable (#{errCount}): {ex.Message}");
+                if (errCount >= 10)
+                {
+                    RequestRecovery("Consecutive audio buffer errors", 500);
+                }
             }
         }
     }
 
-    private void PerformAnalysis()
+    private void PerformAnalysis(int sampleRate)
     {
         try
         {
             _analysisCounter++;
 
-            // Combined Energy calculation and Hamming window application (1 single loop)
             float energySum = 0f;
             for (int i = 0; i < _bufferSize; i++)
             {
@@ -361,29 +644,26 @@ public class FrequencyDetector
                 _fftBuffer[i].Y = 0f;
             }
             float energy = (float)Math.Sqrt(energySum / _bufferSize);
+            if (!float.IsFinite(energy)) energy = 0f;
 
-            // Beat detection
-            _beatDetector.DetectBeat(energy);
+            // Perform FFT first so both spectral-flux BPM estimation and band analysis share the transformed buffer
+            int fftLength = (int)Math.Log(_bufferSize, 2.0);
+            FastFourierTransform.FFT(true, fftLength, _fftBuffer);
 
-            // Update BPM every second
-            var now = DateTime.Now;
-            if ((now - _lastBPMUpdate).TotalSeconds >= 1.0)
+            int safeRate = sampleRate > 0 ? sampleRate : 48000;
+
+            // Spectral-flux autocorrelation BPM detection
+            _beatDetector.ProcessFrame(_fftBuffer, safeRate, _bufferSize, _hopSize, energy);
+
+            // Update BPM every 0.5 seconds
+            var now = DateTime.UtcNow;
+            if ((now - _lastBPMUpdate).TotalSeconds >= 0.5)
             {
                 _lastBPM = _beatDetector.GetCurrentBPM();
                 _lastBPMUpdate = now;
             }
 
-            // Perform FFT
-            int fftLength = (int)Math.Log(_bufferSize, 2.0);
-            FastFourierTransform.FFT(true, fftLength, _fftBuffer);
-
-            // Frequency Content Analysis:
-            // Rather than scanning all 1024 bins, compute sample-rate dependent bin bounds
-            // and scan ONLY the monitored ranges (Bass: 20-200Hz, Treble: 4000-20000Hz).
-            // This skips ~160 middle bins, avoiding hundreds of Math.Sqrt calculations per frame!
-            int sampleRate = _capture?.WaveFormat.SampleRate ?? 48000;
-            float binWidth = (float)sampleRate / _bufferSize;
-            float invBufferSize = 1.0f / _bufferSize;
+            float binWidth = (float)safeRate / _bufferSize;
 
             int minBassBin = Math.Max(1, (int)(20 / binWidth));
             int maxBassBin = Math.Min(_bufferSize / 2 - 1, (int)(BassMaxFreq / binWidth));
@@ -391,7 +671,7 @@ public class FrequencyDetector
             int minTrebleBin = Math.Max(1, (int)(TrebleMinFreq / binWidth));
             int maxTrebleBin = Math.Min(_bufferSize / 2 - 1, (int)(20000 / binWidth));
 
-            float bassSum = 0f;
+            float bassSqSum = 0f;
             float trebleSum = 0f;
             int bassCount = 0;
             int trebleCount = 0;
@@ -400,12 +680,13 @@ public class FrequencyDetector
             float maxBassMag = 0f;
             float maxTrebleMag = 0f;
 
-            // 1. Bass band scan
+            // NAudio.Dsp.FastFourierTransform.FFT(true, ...) already normalizes bins by 1/_bufferSize
             for (int i = minBassBin; i <= maxBassBin; i++)
             {
                 float magSq = _fftBuffer[i].X * _fftBuffer[i].X + _fftBuffer[i].Y * _fftBuffer[i].Y;
-                float mag = (float)Math.Sqrt(magSq) * invBufferSize;
-                bassSum += mag;
+                float mag = (float)Math.Sqrt(magSq);
+                if (!float.IsFinite(mag)) continue;
+                bassSqSum += mag * mag;
                 bassCount++;
                 if (mag > maxBassMag)
                 {
@@ -414,11 +695,11 @@ public class FrequencyDetector
                 }
             }
 
-            // 2. Treble band scan
             for (int i = minTrebleBin; i <= maxTrebleBin; i++)
             {
                 float magSq = _fftBuffer[i].X * _fftBuffer[i].X + _fftBuffer[i].Y * _fftBuffer[i].Y;
-                float mag = (float)Math.Sqrt(magSq) * invBufferSize;
+                float mag = (float)Math.Sqrt(magSq);
+                if (!float.IsFinite(mag)) continue;
                 trebleSum += mag;
                 trebleCount++;
                 if (mag > maxTrebleMag)
@@ -428,23 +709,22 @@ public class FrequencyDetector
                 }
             }
 
-            float bassAverage = bassCount > 0 ? bassSum / bassCount : 0f;
+            float bassAverage = bassCount > 0 ? (float)Math.Sqrt(bassSqSum / bassCount) : 0f;
             float trebleAverage = trebleCount > 0 ? trebleSum / trebleCount : 0f;
 
             if (bassAverage > _maxBassLevel) _maxBassLevel = bassAverage;
             if (trebleAverage > _maxTrebleLevel) _maxTrebleLevel = trebleAverage;
 
-            // If no clients are connected to WebSocket, skip serialization and broadcasting!
-            // Saves CPU, allocations, and battery when Tidal is idle or visualizer is closed.
+            // Skip serialization and broadcasting when no WebSocket clients are attached
             if (!Globals.webSocket.HasConnectedClients)
             {
                 return;
             }
 
-            // Populate reusable DTO without heap allocations
+            _payload.version = 2;
             _payload.utime = DateTime.UtcNow.Ticks;
             _payload.analysis = _analysisCounter;
-            _payload.energy = float.IsFinite(energy) ? energy : 0f;
+            _payload.energy = energy;
 
             _payload.bass.average = float.IsFinite(bassAverage) ? bassAverage : 0f;
             _payload.bass.max = float.IsFinite(_maxBassLevel) ? _maxBassLevel : 0f;
@@ -474,11 +754,9 @@ public class FrequencyDetector
 
             _payload.bpm = float.IsFinite(_lastBPM) ? _lastBPM : 0f;
 
-            // Serialize directly to compact UTF-8 byte array using cached options
             byte[] utf8Bytes = JsonSerializer.SerializeToUtf8Bytes(_payloadArray, _jsonOptions);
             _ = Globals.webSocket.BroadcastBytesAsync(utf8Bytes);
 
-            // Log to console only if console window is open (without JToken.Parse allocation)
             if (ConsoleManager.HasConsole())
             {
                 string jsonString = System.Text.Encoding.UTF8.GetString(utf8Bytes);
@@ -487,26 +765,38 @@ public class FrequencyDetector
         }
         catch (Exception ex)
         {
-            ConsoleManager.Log($"Error in PerformAnalysis: {ex.Message}");
+            int errCount = Interlocked.Increment(ref _consecutiveAnalysisErrors);
+            LogRateLimitedError($"Error in PerformAnalysis (#{errCount}): {ex.Message}");
+            if (errCount >= 10)
+            {
+                RequestRecovery("Consecutive FFT analysis errors", 500);
+            }
         }
     }
 
-    private void OnRecordingStopped(object sender, StoppedEventArgs e)
+    private void OnRecordingStopped(object? sender, StoppedEventArgs e)
     {
+        if (!_isRunning || !ReferenceEquals(sender, _capture))
+        {
+            return;
+        }
+
         if (e.Exception != null)
         {
             if (e.Exception is COMException comEx)
             {
-                HandleCOMException(comEx);
+                LogRateLimitedError($"Recording stopped (COM): {DescribeCOMException(comEx)}");
             }
             else
             {
-                ConsoleManager.Log($"Recording stopped due to error: {e.Exception.Message}");
+                LogRateLimitedError($"Recording stopped due to error: {e.Exception.Message}");
             }
         }
         else
         {
-            ConsoleManager.Log("Recording stopped.");
+            ConsoleManager.LogEvent("Recording stopped unexpectedly.");
         }
+
+        RequestRecovery("RecordingStopped event", 800);
     }
 }

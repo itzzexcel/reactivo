@@ -6,10 +6,31 @@ namespace reactivo.Classes
 {
     public class WebScket
     {
-        private int port = 5343;
+        private sealed class ClientConnection : IDisposable
+        {
+            public readonly WebSocket Socket;
+            public readonly SemaphoreSlim SendLock = new(1, 1);
+            private int _disposed;
+
+            public ClientConnection(WebSocket socket)
+            {
+                Socket = socket;
+            }
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+                try { Socket.Dispose(); } catch { }
+                try { SendLock.Dispose(); } catch { }
+            }
+        }
+
+        private readonly int port = 5343;
+        private readonly object _clientsLock = new();
+        private readonly object _listenerLock = new();
+        private readonly List<ClientConnection> connectedClients = new();
+        private readonly CancellationTokenSource cancellationTokenSource = new();
         private HttpListener? httpListener;
-        private List<WebSocket> connectedClients = new List<WebSocket>();
-        private CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
 
         public WebScket()
         {
@@ -26,73 +47,150 @@ namespace reactivo.Classes
             websocket.StartServerAsync().GetAwaiter().GetResult();
         }
 
-        public async Task StartServerAsync()
+        public async Task StartServerAsync(CancellationToken externalToken = default)
         {
-            httpListener = new HttpListener();
-            httpListener.Prefixes.Add($"http://localhost:{port}/");
-            httpListener.Prefixes.Add($"http://127.0.0.1:{port}/");
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationTokenSource.Token,
+                externalToken
+            );
+            CancellationToken ct = linkedCts.Token;
 
-            try
+            int backoffMs = 1000;
+
+            while (!ct.IsCancellationRequested)
             {
-                httpListener.Start();
-                ConsoleManager.Log($"WebSocket started @ ws://localhost:{port}/");
-
-                while (!cancellationTokenSource.Token.IsCancellationRequested)
+                HttpListener? listener = null;
+                try
                 {
-                    var context = await httpListener.GetContextAsync();
-                    if (context.Request.IsWebSocketRequest)
+                    listener = new HttpListener();
+                    listener.Prefixes.Add($"http://localhost:{port}/");
+                    listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+                    listener.Start();
+
+                    lock (_listenerLock)
                     {
-                        ProcessWebSocketRequest(context);
+                        httpListener = listener;
                     }
-                    else
+
+                    backoffMs = 1000;
+                    ConsoleManager.LogEvent($"WebSocket started @ ws://localhost:{port}/");
+
+                    while (!ct.IsCancellationRequested)
                     {
-                        context.Response.StatusCode = 400;
-                        context.Response.Close();
+                        HttpListenerContext context = await listener.GetContextAsync().WaitAsync(ct);
+                        if (context.Request.IsWebSocketRequest)
+                        {
+                            _ = Task.Run(() => ProcessWebSocketRequestAsync(context, ct), ct);
+                        }
+                        else
+                        {
+                            try
+                            {
+                                context.Response.StatusCode = 400;
+                                context.Response.Close();
+                            }
+                            catch { }
+                        }
                     }
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    ConsoleManager.LogError($"WebSocket listener faulted (restarting in {backoffMs}ms): {ex.Message}");
+                }
+                finally
+                {
+                    lock (_listenerLock)
+                    {
+                        if (ReferenceEquals(httpListener, listener))
+                        {
+                            httpListener = null;
+                        }
+                    }
+
+                    if (listener != null)
+                    {
+                        try { listener.Stop(); } catch { }
+                        try { listener.Abort(); } catch { }
+                        try { listener.Close(); } catch { }
+                    }
+                }
+
+                if (ct.IsCancellationRequested) break;
+
+                try
+                {
+                    await Task.Delay(backoffMs, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                backoffMs = backoffMs switch
+                {
+                    < 2000 => 2000,
+                    < 5000 => 5000,
+                    _ => 10000
+                };
+            }
+        }
+
+        private async Task ProcessWebSocketRequestAsync(HttpListenerContext context, CancellationToken ct)
+        {
+            ClientConnection? conn = null;
+            try
+            {
+                var webSocketContext = await context.AcceptWebSocketAsync(null);
+                conn = new ClientConnection(webSocketContext.WebSocket);
+
+                lock (_clientsLock)
+                {
+                    connectedClients.Add(conn);
+                }
+
+                ConsoleManager.LogEvent("WebSocket client connected.");
+                await HandleWebSocketConnection(conn.Socket, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
             }
             catch (Exception ex)
             {
-                ConsoleManager.Log($"Error: {ex.Message}");
-            }
-        }
-
-        private async void ProcessWebSocketRequest(HttpListenerContext context)
-        {
-            WebSocket webSocket = null!;
-
-            var webSocketContext = await context.AcceptWebSocketAsync(null);
-            webSocket = webSocketContext.WebSocket;
-
-            lock (connectedClients)
-            {
-                connectedClients.Add(webSocket);
-            }
-
-            ConsoleManager.Log($"Client connected!");
-
-            await HandleWebSocketConnection(webSocket);
-
-            if (webSocket != null)
-            {
-                lock (connectedClients)
+                ConsoleManager.LogError($"WebSocket accept/session error: {ex.Message}");
+                if (conn == null)
                 {
-                    connectedClients.Remove(webSocket);
+                    try
+                    {
+                        context.Response.StatusCode = 500;
+                        context.Response.Close();
+                    }
+                    catch { }
+                }
+            }
+            finally
+            {
+                if (conn != null)
+                {
+                    RemoveAndDisposeClient(conn);
                 }
             }
         }
 
-        private async Task HandleWebSocketConnection(WebSocket webSocket)
+        private async Task HandleWebSocketConnection(WebSocket webSocket, CancellationToken ct)
         {
             var buffer = new byte[1024 * 4];
 
             try
             {
-                while (webSocket.State == WebSocketState.Open)
+                while (webSocket.State == WebSocketState.Open && !ct.IsCancellationRequested)
                 {
                     var result = await webSocket.ReceiveAsync(
                         new ArraySegment<byte>(buffer),
-                        cancellationTokenSource.Token
+                        ct
                     );
 
                     if (result.MessageType == WebSocketMessageType.Text)
@@ -100,7 +198,7 @@ namespace reactivo.Classes
                         var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
                         if (!string.IsNullOrEmpty(message))
                         {
-                            ConsoleManager.Log($"Got ID from WebSocket. Device: {message}");
+                            ConsoleManager.LogEvent($"Got ID from WebSocket. Device: {message}");
 
                             string previousDevice = Globals.tidalReceivedDevice;
                             Globals.tidalReceivedDevice = message;
@@ -113,10 +211,10 @@ namespace reactivo.Classes
                     }
                     else if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        ConsoleManager.Log("Client terminated ws conncetion");
+                        ConsoleManager.LogEvent("Client terminated ws connection.");
                         await webSocket.CloseAsync(
                             WebSocketCloseStatus.NormalClosure,
-                            "Cerrando",
+                            "Closing",
                             CancellationToken.None
                         );
                         break;
@@ -125,15 +223,14 @@ namespace reactivo.Classes
             }
             catch (WebSocketException wsEx)
             {
-                ConsoleManager.Log($"WebSocket error: {wsEx.Message}");
+                ConsoleManager.LogEvent($"WebSocket disconnected: {wsEx.Message}");
             }
             catch (OperationCanceledException)
             {
-                ConsoleManager.Log("WebSocket operation cancelled");
             }
             catch (Exception ex)
             {
-                ConsoleManager.Log($"Unhandled exception: {ex.Message}");
+                ConsoleManager.LogError($"WebSocket receive exception: {ex.Message}");
             }
             finally
             {
@@ -142,26 +239,36 @@ namespace reactivo.Classes
                 {
                     try
                     {
-                        await webSocket.CloseAsync(
+                        using var closeTimeout = new CancellationTokenSource(500);
+                        await webSocket.CloseOutputAsync(
                             WebSocketCloseStatus.NormalClosure,
                             "STATUS_CLOSING",
-                            CancellationToken.None
+                            closeTimeout.Token
                         );
                     }
                     catch { }
                 }
-
-                webSocket.Dispose();
-                ConsoleManager.Log("WebSocket closed...");
             }
         }
 
+        private void RemoveAndDisposeClient(ClientConnection conn)
+        {
+            bool removed;
+            lock (_clientsLock)
+            {
+                removed = connectedClients.Remove(conn);
+            }
+            if (removed)
+            {
+                conn.Dispose();
+            }
+        }
 
         public bool HasConnectedClients
         {
             get
             {
-                lock (connectedClients)
+                lock (_clientsLock)
                 {
                     return connectedClients.Count > 0;
                 }
@@ -170,76 +277,119 @@ namespace reactivo.Classes
 
         public async Task SendMessageToClient(WebSocket webSocket, string message)
         {
-            if (webSocket?.State == WebSocketState.Open)
+            if (webSocket?.State != WebSocketState.Open) return;
+
+            ClientConnection? match = null;
+            lock (_clientsLock)
             {
-                var buffer = Encoding.UTF8.GetBytes(message);
-                await webSocket.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true, CancellationToken.None);
+                match = connectedClients.Find(c => ReferenceEquals(c.Socket, webSocket));
+            }
+
+            var buffer = Encoding.UTF8.GetBytes(message);
+            var segment = new ArraySegment<byte>(buffer);
+
+            if (match != null)
+            {
+                if (!match.SendLock.Wait(0)) return;
+                try
+                {
+                    using var sendTimeout = new CancellationTokenSource(1500);
+                    await webSocket.SendAsync(segment, WebSocketMessageType.Text, true, sendTimeout.Token);
+                }
+                catch (Exception ex)
+                {
+                    ConsoleManager.LogError($"SendMessageToClient failed: {ex.Message}");
+                    RemoveAndDisposeClient(match);
+                }
+                finally
+                {
+                    try { match.SendLock.Release(); } catch (ObjectDisposedException) { }
+                }
+            }
+            else
+            {
+                try
+                {
+                    using var sendTimeout = new CancellationTokenSource(1500);
+                    await webSocket.SendAsync(segment, WebSocketMessageType.Text, true, sendTimeout.Token);
+                }
+                catch { }
             }
         }
 
         public async Task BroadcastBytesAsync(byte[] buffer)
         {
-            List<WebSocket> snapshot;
-            lock (connectedClients)
+            List<ClientConnection> snapshot;
+            lock (_clientsLock)
             {
                 if (connectedClients.Count == 0) return;
-                snapshot = new List<WebSocket>(connectedClients);
+                snapshot = new List<ClientConnection>(connectedClients);
             }
 
             var segment = new ArraySegment<byte>(buffer);
-            var clientsToRemove = new List<WebSocket>();
+            List<ClientConnection>? deadClients = null;
 
-            foreach (var client in snapshot)
+            foreach (var conn in snapshot)
             {
-                if (client.State == WebSocketState.Open)
+                if (conn.Socket.State != WebSocketState.Open)
                 {
-                    try
-                    {
-                        await client.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
-                    }
-                    catch
-                    {
-                        clientsToRemove.Add(client);
-                    }
+                    deadClients ??= new List<ClientConnection>();
+                    deadClients.Add(conn);
+                    continue;
                 }
-                else
+
+                // Non-blocking: drop stale analysis frame if previous send is still in flight
+                bool acquired = false;
+                try
                 {
-                    clientsToRemove.Add(client);
+                    acquired = conn.SendLock.Wait(0);
+                }
+                catch (ObjectDisposedException)
+                {
+                    deadClients ??= new List<ClientConnection>();
+                    deadClients.Add(conn);
+                    continue;
+                }
+
+                if (!acquired) continue;
+
+                try
+                {
+                    using var timeoutCts = new CancellationTokenSource(1500);
+                    await conn.Socket.SendAsync(segment, WebSocketMessageType.Text, true, timeoutCts.Token);
+                }
+                catch
+                {
+                    deadClients ??= new List<ClientConnection>();
+                    deadClients.Add(conn);
+                }
+                finally
+                {
+                    try { conn.SendLock.Release(); } catch (ObjectDisposedException) { }
                 }
             }
 
-            if (clientsToRemove.Count > 0)
+            if (deadClients != null)
             {
-                lock (connectedClients)
+                foreach (var dead in deadClients)
                 {
-                    foreach (var client in clientsToRemove)
-                    {
-                        connectedClients.Remove(client);
-                        try
-                        {
-                            client?.Dispose();
-                        }
-                        catch { }
-                    }
+                    RemoveAndDisposeClient(dead);
                 }
             }
         }
 
         public async Task BroadcastMessage(string message)
         {
-            lock (connectedClients)
-            {
-                if (connectedClients.Count == 0) return;
-            }
+            if (!HasConnectedClients) return;
             var buffer = Encoding.UTF8.GetBytes(message);
             await BroadcastBytesAsync(buffer);
         }
 
         public async Task SendMessageToClient(int clientIndex, string message)
         {
-            WebSocket client;
+            ClientConnection client;
 
-            lock (connectedClients)
+            lock (_clientsLock)
             {
                 if (clientIndex < 0 || clientIndex >= connectedClients.Count)
                     throw new ArgumentOutOfRangeException(nameof(clientIndex));
@@ -247,28 +397,40 @@ namespace reactivo.Classes
                 client = connectedClients[clientIndex];
             }
 
-            await SendMessageToClient(client, message);
+            await SendMessageToClient(client.Socket, message);
         }
 
         public void StopServer()
         {
-            cancellationTokenSource.Cancel();
-            httpListener?.Stop();
-            httpListener?.Close();
+            try { cancellationTokenSource.Cancel(); } catch { }
 
-            lock (connectedClients)
+            lock (_listenerLock)
             {
-                foreach (var client in connectedClients)
+                if (httpListener != null)
                 {
-                    client?.Dispose();
+                    try { httpListener.Stop(); } catch { }
+                    try { httpListener.Abort(); } catch { }
+                    try { httpListener.Close(); } catch { }
+                    httpListener = null;
                 }
+            }
+
+            List<ClientConnection> toDispose;
+            lock (_clientsLock)
+            {
+                toDispose = new List<ClientConnection>(connectedClients);
                 connectedClients.Clear();
+            }
+
+            foreach (var conn in toDispose)
+            {
+                conn.Dispose();
             }
         }
 
         public int GetConnectedClientsCount()
         {
-            lock (connectedClients)
+            lock (_clientsLock)
             {
                 return connectedClients.Count;
             }
